@@ -1,0 +1,339 @@
+---
+title: "Explore Initial Data"
+author: "Chris McKennan"
+date: "July 21, 2016"
+output: html_document
+---
+
+The purpose of this R-markdown file is to do exploratory data analysis using Carole's data.
+
+## Install Packages and Functions
+
+```{r Packages}
+library('nlme')
+library('knitr')
+library('printr')
+library('gtools')
+library('leapp')
+library('esaBcv')
+library('MASS')
+library('ruv')
+library('corpcor')
+library('cate')
+library('qvalue')
+library('IlluminaHumanMethylation450kanno.ilmn12.hg19')
+library('biomaRt')
+```
+
+## Load functions
+
+```{r Functions}
+source("../R/UsefulFunctions.R")
+```
+
+## Load ALL data into R
+
+```{r LoadData}
+path.genotype <- "../data/Nicodemus2016/combined_geno.txt"  #comma separated
+path.ids <- "../data/Nicodemus2016/ACR_ids.csv"   #comma separated
+path.meth.cov <- "../data/Nicodemus2016/processed_meth_data_covarates.txt"   #comma separated
+path.processed.meth <- "../data/Nicodemus2016/processed_meth_data.txt"    #" " separated
+path.normalized.RNA <- "../data/Nicodemus2016/RNASeq_normalizedcounts.txt"    #" " separated
+
+X.geno <- data.frame(read.table(path.genotype, sep=",", dec=".", header=T))
+X.ids <- data.frame(read.table(path.ids, sep=",", dec=".", header=T))
+X.meth.cov <- data.frame(read.table(path.meth.cov, sep=",", dec=".", header=T))
+
+X.proc.meth <- data.frame(read.table(path.processed.meth, sep=" ", dec=".", header=T))
+X.proc.meth$X.CpG. <- as.character(X.proc.meth$X.CpG.)
+
+X.proc.RNA <- data.frame(read.table(path.normalized.RNA, dec=".", sep=" ", header=T))
+X.proc.RNA$Gene <- as.character(X.proc.RNA$Gene)
+```
+
+## Just Methylation
+
+Process methylation to convert it to M-values
+```{r MethylationProcessing}
+n.meth <- ncol(X.proc.meth) - 1
+p.meth <- nrow(X.proc.meth)
+Beta.0 <- as.matrix(X.proc.meth[,2:(n.meth+1)])   #Processed beta values, p.meth x n.meth data matrix
+
+#Density plot of data#
+for (i in 1:n.meth) {
+  d.i <- density(Beta.0[,i])
+  if (i == 1) {
+    plot(d.i$x, d.i$y, xlab="Beta value", ylab="Density", main="Density Plot of Data", type="l", col=colors()[sample(1:length(colors()), 1)])
+  } else {
+    lines(d.i$x, d.i$y, col=colors()[sample(1:length(colors()), 1)])
+  }
+}   #This looks good. Seems data has been properly normalized
+
+#Replace beta values less than 0 or greater than 1 with the smalles value > 0 or largest value < 1#
+ind.l0 <- which(Beta.0 < 0, arr.ind=T); replace.l0 <- min(Beta.0[which(Beta.0 > 0, arr.ind=T)])
+ind.g1 <- which(Beta.0 > 1, arr.ind=T); replace.g1 <- max(Beta.0[which(Beta.0 < 1, arr.ind=T)])
+
+Beta <- Beta.0
+Beta[ind.l0] <- replace.l0
+Beta[ind.g1] <- replace.g1
+
+M.proc <- logit(Beta)   #Processed M-values
+```
+
+Identify any additional structure in methylation besides the given covariates
+```{r MethylationStructure}
+##Create Methylation covariate matrix##
+#First need to get indices in terms of M.proc matrix
+Cov.meth.ids <- as.character(X.ids$processed_meth_data_covarates[m.which(as.character(X.ids$processed_meth_data), colnames(M.proc))])    #In the order of the columns of the M-values
+Cov.meth <- data.frame(as.matrix( X.meth.cov[m.which(as.character(X.meth.cov$ID), Cov.meth.ids), 3:6] ))
+colnames(Cov.meth) <- c("Status", "Gender", "Age", "Ethnicity")
+Cov.meth$Status <- as.factor(Cov.meth$Status)
+Cov.meth$Gender <- as.factor(Cov.meth$Gender)
+Cov.meth$Ethnicity <- as.factor(Cov.meth$Ethnicity)
+Cov.meth$Age <- as.numeric(as.character(Cov.meth$Age))
+mat.meth <- model.matrix(~Status + Gender + Age + Ethnicity, data=Cov.meth)
+d.meth <- ncol(mat.meth)
+Q.meth <- qr.Q(qr(mat.meth), complete = T)[,(d.meth+1):n.meth]    #orthog.meth = Q.meth %*% t(Q.meth)
+
+r.confound <- est.factor.num(M.proc %*% Q.meth, method="ed")
+```
+
+Apply CATE to processed methylation data
+```{r Methylation_CATE}
+cate.meth <- cate.fit(X.primary=cbind(mat.meth[,2]), X.nuis=cbind(mat.meth[,-2]), Y=t(as.matrix(M.proc)), adj.method="rr", r=r.confound, fa.method="ml", calibrate=F)
+tmp.V <- svd(1/p.meth * t(cate.meth$Gamma / cate.meth$Sigma) %*% cate.meth$Gamma)$v
+Info.mat <- diag(svd(1/p.meth * t(cate.meth$Gamma / cate.meth$Sigma) %*% cate.meth$Gamma)$d)
+Sigma.cate <- cate.meth$Sigma
+Gamma.cate <- cate.meth$Gamma %*% tmp.V
+alpha.cate <- t(tmp.V) %*% cate.meth$alpha    #I worry that we are UNDERESTIMATING the correlation here, since the larger indices correspond to the diagonal elements of Info.mat that are on the order of 1/n.meth. The analysis might therefore be anti-conservative
+Z.cate <- cate.meth$Z %*% tmp.V
+
+orthog.nuis <- diag(n.meth) - mat.meth[,-2] %*% solve(t(mat.meth[,-2]) %*% mat.meth[,-2], t(mat.meth[,-2]))
+n.stand.status <- t(cbind(mat.meth[,2])) %*% orthog.nuis %*% cbind(mat.meth[,2])
+confound.pvalue <- 1 - pchisq(n.stand.status * t(alpha.cate) %*% alpha.cate, df=r.confound)
+
+cate.mat <- cbind(mat.meth, Z.cate)
+orthog.mat.cate <- diag(n.meth) - cate.mat %*% solve(t(cate.mat) %*% cate.mat, t(cate.mat))
+dof.cate <- n.meth - ncol(cate.mat)
+B.cate <- M.proc %*% cate.mat %*% solve(t(cate.mat) %*% cate.mat)
+cov.rows.B <- solve(t(cate.mat) %*% cate.mat)
+Sigma.cate.2 <- rowSums((M.proc %*% orthog.mat.cate) * M.proc) / dof.cate
+z.status <- B.cate[,2] / sqrt(Sigma.cate.2) / sqrt(cov.rows.B[2,2])
+p.values.status <- 2 - 2 * pt(abs(z.status), df=dof.cate)
+q.status <- qvalue(p.values.status)    #Jessie is definitely OVERESTIMATING the number of differentially methylated CpGs. We see about 7700 at a q-value of 0.05. Even our analysis may be an overestimate, since some of the latent factors are not very informative (since they are on the order of 1/n)
+
+#Shrink the variance using an inverse gamma prior and normal likelihood#
+out.shrink <- optim(par=c(1,-3), fn=log.like.gamma, gr=d.llgamma, method="BFGS", hessian=T, n=dof.cate, suff=Sigma.cate.2*dof.cate)
+alpha.gamma <- exp(out.shrink$par[1])
+beta.gamma <- exp(out.shrink$par[2])
+shrunk.Sigma.cate <- (1/2*dof.cate*Sigma.cate.2 + beta.gamma) / (dof.cate/2 + alpha.gamma)
+z.status.shrunk <- B.cate[,2] / sqrt(shrunk.Sigma.cate) / sqrt(cov.rows.B[2,2])
+p.values.status.shrunk <- 2 - 2 * pt(abs(z.status.shrunk), df=dof.cate)
+q.status.shrunk <- qvalue(p.values.status.shrunk)  #We don't see much of a difference when we shrink the variances (i.e. there is no point in using Limma here)
+```
+Jessie probably overestimated the number of true hits. I am also probably overestimating the number of true hits, since the information matrix is on the order to 1/n.meth. Note that for different distributions on the error $E$ in the linear model, we will get different expected values for the information matrix when the true $\Gamma$ is small (this will depend on the 3 and 4th cumulents of the error distribution with respect to the normal distribution). I need to add this to the paper...
+
+## CpG - Gene correlation
+I will follow the procedure outlined in Jessie's paper. For fixed CpG, I will find the gene closest to it. This needs work...
+
+Determine individuals for which we have both methylation and RNAseq data
+```{r OverlapCpGRNA}
+n.RNA <- ncol(X.proc.RNA) - 1
+individuals.RNA <- colnames(X.proc.RNA)[2:(n.RNA+1)]
+ind.rna.meQTL <- match(as.character(X.ids$rnaseq_normalizedcounts), individuals.RNA)
+indiv.rna.meQTL <- individuals.RNA[ind.rna.meQTL]
+ind.meth.meQTL <- which(!is.na(indiv.rna.meQTL)[1:n.meth])    #Methylation indices
+ind.rna.meQTL <- match(as.character(X.ids$rnaseq_normalizedcounts[ind.meth.meQTL]), individuals.RNA)    #RNA indices
+n.overlap <- length(ind.rna.meQTL)
+```
+
+Create Ensemble gene look-up table using Perl
+```{bash}
+perl EnsembleGI.pl
+```
+
+Load look-up tables I will need
+```{r LoadCpGFiles}
+CpG.map <- IlluminaHumanMethylation450kanno.ilmn12.hg19@data$Locations   #Illumina CpG markers
+CpG.map$chr <- gsub("chr", "", CpG.map$chr)
+CpG.map <- CpG.map[rownames(CpG.map) %in% X.proc.meth$X.CpG.,]
+CpG.map <- CpG.map[match(rownames(CpG.map), X.proc.meth$X.CpG.),]   #The final list contains only CpG markers used in the ARC study, in the order of ARC study data
+
+Ens.IDs <- data.frame(read.table("EnsembleGI.txt", header = T, sep="\t"))   #Ensemble Gene start and end sites
+Ens.IDs$EnsembleGI <- as.character(Ens.IDs$EnsembleGI)
+Ens.IDs$EnsembleGI <- gsub("\\.[0-9]+$", "", Ens.IDs$EnsembleGI)
+Ens.IDs$Chromosome <- as.character(Ens.IDs$Chromosome)
+Ens.IDs$Gene_Start <- as.numeric(Ens.IDs$Gene_Start)
+Ens.IDs$Gene_End <- as.numeric(Ens.IDs$Gene_End)
+Ens.IDs$Coding <- as.numeric(Ens.IDs$Coding)
+Ens.IDs.overlap <- Ens.IDs[Ens.IDs$EnsembleGI %in% X.proc.RNA$Gene,]  #The final list contains genes that were ID'd in the RNA-seq experiment and appear in the Ensemble Gene ID list
+Ens.IDs.coding <- Ens.IDs[which(Ens.IDs$Coding == 1),]
+```
+Note that there are 13 genes on Jessie's gene list that no longer appear in the Ensemble website.
+
+Below I will map CpG's to coding genes
+```{r MatchCpGGenes_Coding}
+Gene.list.gene <- list()
+Gene.list.dist <- list()
+ind.search <- c()
+count <- 1
+for (c in unique(CpG.map$chr)) {
+  ind.cpg.c <- which(CpG.map$chr == c)   #CpG indices on chromosome c
+  ind.ens.c <- which(Ens.IDs.coding$Chromosome == c)   #Ensemble indices on chromosome c
+  ens.ids.c <- Ens.IDs.coding[ind.ens.c,]   #Ensemble genes on chromosome c
+  ind.search <- c(ind.search, ind.cpg.c)
+  
+  for (ind in ind.cpg.c) {
+    position <- CpG.map$pos[ind]
+    ind.on <- which(ens.ids.c$Gene_Start <= position & ens.ids.c$Gene_End >= position)
+    if (length(ind.on) >= 1) {     #CpG lies on the gene
+      Gene.list.gene[[count]] <- ens.ids.c$EnsembleGI[ind.on]     #Ensemble gene id
+      Gene.list.dist[[count]] <- rep(0, length(ind.on))
+    } else {    #CpG does NOT lie on a gene in the chromosome
+      tmp.min <- apply(cbind(abs(ens.ids.c$Gene_Start-position), abs(ens.ids.c$Gene_End-position)), 1, min)
+      tmp.min.ind <- which.min(tmp.min)
+      Gene.list.gene[[count]] <- ens.ids.c$EnsembleGI[tmp.min.ind]
+      Gene.list.dist[[count]] <- tmp.min[tmp.min.ind]
+    }
+    
+    count <- count + 1
+  }
+}
+
+Gene.list.gene <- Gene.list.gene[order(ind.search)]    #Put in the order of methylation data
+Gene.list.dist <- Gene.list.dist[order(ind.search)]
+in.overlap <- list()
+stand.effect.1 <- c()     #Regression is CpG ~ RNAseq
+stand.effect.2 <- c()     #Regression is CpG ~ RNAseq + (Covariates in Cate)
+orthog.rest <- diag(n.overlap) - cate.mat[ind.meth.meQTL,] %*% solve(t(cate.mat[ind.meth.meQTL,]) %*% cate.mat[ind.meth.meQTL,]) %*% t(cate.mat[ind.meth.meQTL,])
+RNA.mat <- X.proc.RNA[,2:ncol(X.proc.RNA)]
+for (g in 1:length(Gene.list.gene)) {
+  meth.g <- M.proc[g,ind.meth.meQTL]
+  meth.g.stand <- as.vector(orthog.rest %*% cbind(meth.g))
+  
+  in.overlap[[g]] <- as.numeric(Gene.list.gene[[g]] %in% Ens.IDs.overlap$EnsembleGI)
+  stand.effect.tmp.1 <- rep(NA, length(in.overlap[[g]]))
+  stand.effect.tmp.2 <- rep(NA, length(in.overlap[[g]]))
+  for (i in which(in.overlap[[g]] == 1)) {
+    rna.g <- as.numeric(RNA.mat[which(X.proc.RNA$Gene == Gene.list.gene[[g]][i]),ind.rna.meQTL])
+    stand.effect.tmp.1[i] <- Stand.effect.1(rna.g, meth.g)
+    stand.effect.tmp.2[i] <- Stand.effect.2(as.vector(orthog.rest %*% cbind(rna.g)), meth.g.stand, dof=n.overlap - ncol(cate.mat))
+  }
+  if (length(which(in.overlap[[g]] == 1)) >= 1) {
+    stand.effect.1[g] <- stand.effect.tmp.1[which.max(abs(stand.effect.tmp.1))]
+    stand.effect.2[g] <- stand.effect.tmp.2[which.max(abs(stand.effect.tmp.2))]
+  } else {
+    stand.effect.1[g] <- NA
+    stand.effect.2[g] <- NA
+  }
+}
+```
+
+Plot the results
+```{r PlotmeQTL}
+hist(qnorm(pt(stand.effect.1, df=n.overlap - 2)), xlab="Z-score", ylab="Frequency", main="Simple Linear Regression CpG ~ mRNA")
+hist(qnorm(pt(stand.effect.2, df=n.overlap - ncol(cate.mat))), xlab="Z-score", ylab="Frequency", main="CpG ~ mRNA + (Methylation Covariates)")
+
+hist(2 - 2*pt(abs(stand.effect.1), df=n.overlap - 2), xlab="P-value", ylab="Frequency", main="Simple Linear Regression CpG ~ mRNA")
+hist(2 - 2*pt(abs(stand.effect.2), df=n.overlap - ncol(cate.mat)), xlab="P-value", ylab="Frequency", main="Simple Linear Regression CpG ~ mRNA")
+```
+
+##meQTL analysis
+Look for SNPs within 5kb of a CpG in the study
+
+Map SNPs to chromosome location and get individual covariates
+```{r CreateSNPLookupTable}
+SNPs.observed <- as.character(X.geno[,1])
+
+ensembl = useMart("ENSEMBL_MART_SNP")
+ensembl = useDataset("hsapiens_snp", mart = ensembl)   #Use human SNP dataset
+snp.attributes <- c("refsnp_id", "chr_name", "chrom_start", "chrom_start", "allele", "minor_allele")
+
+#Get SNP attributes#
+p.SNPs <- nrow(X.geno)
+n.iterate <- 500
+for (i in 1:ceiling(p.SNPs / n.iterate)) {
+  start.i <- (i - 1) * n.iterate + 1
+  end.i <- min(p.SNPs, i * n.iterate)
+  if (i == 1) {
+    SNP.ids <- getBM(attributes = snp.attributes, filters = "snp_filter", values = as.character(X.geno[start.i:end.i,1]), mart = ensembl)
+  } else {
+    SNP.ids <- rbind(SNP.ids, getBM(attributes = snp.attributes, filters = "snp_filter", values = as.character(X.geno[start.i:end.i,1]), mart = ensembl))
+  }
+}
+
+n.geno <- ncol(X.geno) - 1
+individuals.geno <- colnames(X.geno)[2:(n.geno + 1)]
+individuals.geno <- gsub("^X(.*)$", "\\1", individuals.geno, perl=T)
+individuals.geno <- gsub("\\.", "-", individuals.geno, perl=T)
+order.geno.ids <- match(as.character(X.ids$combined_geno), individuals.geno)
+ind.use.meth <- intersect(which(!is.na(order.geno.ids)), (1:n.meth))   #The genotypes are in the correct order and ind.use.meth are the methylation indices to use
+```
+SNP.ids contains all of the SNPs in X.geno, their location and chromosome number.
+
+This will collect all CpG positions of the CpGs we analyzed
+```{r CollectCpGs}
+CpG.map <- IlluminaHumanMethylation450kanno.ilmn12.hg19@data$Locations   #Illumina CpG markers
+CpG.map$chr <- gsub("chr", "", CpG.map$chr)
+CpG.map <- CpG.map[rownames(CpG.map) %in% X.proc.meth$X.CpG.,]
+CpG.map <- CpG.map[match(rownames(CpG.map), X.proc.meth$X.CpG.),]   #The final list contains only CpG markers used in the ARC study, in the order of the ARC study data
+```
+
+For each CpG, find SNPs +- max.dist away from it. Hopefully, SNPs that are close to one another will be highly correlated. I will use the first two principal components of the individual relatedness matrix.
+```{r MapSNPstoCpGs}
+max.dist <- 5e3     #Search for SNPs +- max.dist away from CpG on interest
+Geno <- as.matrix(X.geno[,2:(n.geno+1)])
+Geno.centered <- scale(x=Geno, center=T, scale=F)
+Ancenstry <- svd(t(Geno.centered) %*% Geno.centered)$v[,1:2]
+
+#Plot Ancestry#
+plot(Ancenstry[which(Cov.geno.all$Ethnicity == "AA"),1], Ancenstry[which(Cov.geno.all$Ethnicity == "AA"),2], col="blue", xlab="PC1", ylab="PC2", xlim=range(Ancenstry[,1]), ylim=range(Ancenstry[,2]))
+points(Ancenstry[which(Cov.geno.all$Ethnicity == "EA"),1], Ancenstry[which(Cov.geno.all$Ethnicity == "EA"),2], col="red")
+points(Ancenstry[which(Cov.geno.all$Ethnicity == "Other"),1], Ancenstry[which(Cov.geno.all$Ethnicity == "Other"),2], col="black")
+legend("bottomleft", legend=c("AA", "EA", "Other"), fill=c("blue", "red", "black"))
+###############
+
+count <- 0
+for (c in unique(CpG.map$chr)) {
+  cpg.c.ind <- which(CpG.map$chr == c)
+  snp.c.ind <- which(SNP.ids$chr_name == c)
+  SNP.ids.c <- SNP.ids[snp.c.ind,]
+  
+  for (g in cpg.c.ind) {
+    cpg.pos.g <- as.numeric(CpG.map$pos[g])
+    ind.snps.c.g <- which(abs(as.numeric(SNP.ids.c$chrom_start) - cpg.pos.g) <= max.dist)
+    #meth.g <- as.vector( orthog.cov.meQTL %*% M.proc[g,ind.use.meth]  )
+    count <- count + length(ind.snps.c.g)
+  }
+}
+
+
+SNP.CpG <- rep(NA, p.meth)    #SNP that is associated with CpG
+zscore.meQTL <- rep(NA, p.meth)                 #Z-score of CpG ~ SNP regression
+count <- 0
+Cov.meQTL <- cbind(mat.meth[ind.use.meth,1], mat.meth[ind.use.meth,3], mat.meth[ind.use.meth,4], Ancenstry, Z.cate[ind.use.meth,])
+orthog.cov.meQTL <- diag(n.geno) - Cov.meQTL %*% solve(t(Cov.meQTL) %*% Cov.meQTL, t(Cov.meQTL))
+for (c in unique(CpG.map$chr)) {
+  cpg.c.ind <- which(CpG.map$chr == c)
+  snp.c.ind <- which(SNP.ids$chr_name == c)
+  SNP.ids.c <- SNP.ids[snp.c.ind,]
+  
+  for (g in cpg.c.ind) {
+    cpg.pos.g <- as.numeric(CpG.map$pos[g])
+    ind.snps.c.g <- which(abs(as.numeric(SNP.ids.c$chrom_start) - cpg.pos.g) <= max.dist)
+    meth.g <- as.vector( orthog.cov.meQTL %*% M.proc[g,ind.use.meth]  )
+    if (length(ind.snps.c.g) > 0) {
+      ind.snps.c.g.use <- sample(ind.snps.c.g, 1, replace=F)  #Randomly choose SNP to look at
+
+      SNP.CpG[g] <- as.character(SNP.ids.c$refsnp_id[ind.snps.c.g.use])
+      zscore.meQTL[g] <- Stand.effect.2(as.vector(orthog.cov.meQTL %*% Geno[which(SNPs.observed == SNP.CpG[g]),]), meth.g, dof=n.geno-ncol(Cov.meQTL)-1)
+    }
+  }
+}
+```
+
+## Session information
+
+```{r info}
+sessionInfo()
+```
